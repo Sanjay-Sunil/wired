@@ -1,0 +1,61 @@
+#!/bin/bash
+# After resume (lid open) or boot: scan, rank every IIITKottayam* access point by
+# signal, and connect to the best one, falling back down the list if an AP doesn't
+# answer. The portal login itself is handled by the NM dispatcher (90-iiitk-login).
+
+IFACE=${IIITK_IFACE:-$(nmcli -t -f DEVICE,TYPE dev | awk -F: '$2 == "wifi" { print $1; exit }')}
+FIVE_GHZ_BONUS=10   # prefer 5 GHz when signal is comparable (it's much faster)
+KEEP_MARGIN=10      # don't hop if the current AP is within this many points of the best
+MAX_TRIES=4
+LOG() { logger -t iiitk-wifi "$*"; }
+
+exec 9>/run/iiitk-wifi.lock
+flock -n 9 || exit 0
+[[ -n "$IFACE" ]] || { LOG "no Wi-Fi device found"; exit 0; }
+
+# Wait for NetworkManager to finish waking up and the radio to come back.
+for _ in $(seq 30); do
+  state=$(nmcli -t -g GENERAL.STATE dev show "$IFACE" 2>/dev/null)
+  [[ -n "$state" && "$state" != *unavailable* && "$state" != *unmanaged* ]] && break
+  sleep 1
+done
+
+# Saved profiles for the college networks: SSID -> connection name.
+declare -A PROFILE
+while IFS=: read -r name type; do
+  [[ "$type" == 802-11-wireless ]] || continue
+  ssid=$(nmcli -t -g 802-11-wireless.ssid con show "$name" 2>/dev/null)
+  [[ "$ssid" == IIITKottayam* ]] && PROFILE[$ssid]=$name
+done < <(nmcli -t -f NAME,TYPE con show)
+(( ${#PROFILE[@]} )) || { LOG "no saved IIITKottayam profiles"; exit 0; }
+
+nmcli dev wifi rescan ifname "$IFACE" 2>/dev/null
+sleep 4
+
+# Rank APs: score = signal (+ bonus on 5 GHz). Output: score bssid ssid
+ranked=$(nmcli -t -e no -f ACTIVE,SSID,BSSID,SIGNAL,FREQ dev wifi list ifname "$IFACE" --rescan no |
+  sed -E 's/^([^:]*):(.*):(([0-9A-F]{2}:){5}[0-9A-F]{2}):([0-9]+):([0-9]+) MHz$/\1|\2|\3|\5|\6/' |
+  while IFS='|' read -r active ssid bssid signal freq; do
+    [[ -n "${PROFILE[$ssid]}" ]] || continue
+    score=$signal; (( freq >= 5000 )) && score=$((score + FIVE_GHZ_BONUS))
+    echo "$score $active $bssid $ssid"
+  done | sort -rn)
+[[ -n "$ranked" ]] || { LOG "no IIITKottayam APs in range"; exit 0; }
+
+best=$(head -1 <<<"$ranked" | cut -d' ' -f1)
+current=$(awk '$2 == "yes" { print $1; exit }' <<<"$ranked")
+if [[ -n "$current" ]] && (( current + KEEP_MARGIN >= best )); then
+  LOG "already on a good AP (score $current, best $best)"
+  exit 0
+fi
+
+n=0
+while read -r score _ bssid ssid; do
+  (( ++n > MAX_TRIES )) && break
+  LOG "trying $ssid via $bssid (score $score)"
+  if nmcli -w 15 con up id "${PROFILE[$ssid]}" ifname "$IFACE" ap "$bssid" >/dev/null 2>&1; then
+    LOG "connected to $ssid via $bssid"
+    exit 0
+  fi
+done <<<"$ranked"
+LOG "could not connect to any of the top $MAX_TRIES APs"

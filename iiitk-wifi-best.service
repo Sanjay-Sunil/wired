@@ -1,0 +1,12 @@
+[Unit]
+Description=Connect to the strongest IIIT Kottayam Wi-Fi AP after wake/boot
+After=NetworkManager.service suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/iiitk-wifi-best
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

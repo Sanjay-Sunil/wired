@@ -1,0 +1,95 @@
+#!/bin/bash
+# NetworkManager dispatcher: auto-login to the IIIT Kottayam FortiGate captive portal.
+# Runs as root on every network event; acts only on IIITKottayam* Wi-Fi.
+# Credentials: /etc/iiitk-login.conf (root-only), containing:
+#   IIITK_USER='your-username'
+#   IIITK_PASS='your-password'
+
+IFACE="$1" ACTION="$2"
+# Run with "timer" from iiitk-login.timer: look up the active Wi-Fi ourselves.
+# Catches the portal's 6-hour session expiry even if NM's connectivity check misses it.
+if [[ "$1" == timer ]]; then
+  read -r CONNECTION_ID IFACE < <(nmcli -t -f NAME,DEVICE,TYPE con show --active |
+    awk -F: '$3 == "802-11-wireless" { print $1, $2; exit }')
+  ACTION=timer
+  [[ -n "$IFACE" ]] || exit 0
+fi
+CONF=/etc/iiitk-login.conf
+PROBE=http://neverssl.com/
+LOG() { logger -t iiitk-login "$*"; }
+
+case "$ACTION" in up|connectivity-change|dhcp4-change|timer) ;; *) exit 0 ;; esac
+[[ "$CONNECTION_ID" == IIITKottayam* ]] || exit 0
+[[ -r "$CONF" ]] || { LOG "missing $CONF"; exit 0; }
+# shellcheck source=/dev/null
+. "$CONF"
+
+# Failsafe: the portal caps concurrent users, so stop after MAX_FAILS failed logins
+# in a row (across all runs) instead of hammering it. The count lives in /run, so a
+# reboot clears it; so does any successful login, including one done by hand in a browser.
+FAILS=/run/iiitk-login.failures
+MAX_FAILS=3
+
+notify() {  # desktop notification for whoever owns the active graphical session
+  local user
+  user=$(loginctl list-sessions --no-legend | awk '$4 == "seat0" { print $3; exit }')
+  [[ -n "$user" ]] && systemd-run --quiet --user --machine="$user@" \
+    notify-send -u critical "College Wi-Fi" "$1" 2>/dev/null
+}
+
+login() (
+  exec 9>/run/iiitk-login.lock
+  flock -n 9 || exit 0
+
+  for _ in 1 2 3 4 5; do
+    # Unauthenticated HTTP gets intercepted by FortiGate and points at fgtauth?<magic>.
+    page=$(curl -s -i -m 8 --interface "$IFACE" "$PROBE") || { sleep 3; continue; }
+    portal=$(grep -oE 'https?://[^"'\'' ]+/fgtauth\?[0-9a-fA-F]+' <<<"$page" | head -1)
+    if [[ -z "$portal" ]]; then
+      # Not intercepted: either already logged in, or the network isn't ready yet.
+      if [[ -n "$page" ]]; then
+        [[ "$ACTION" == timer ]] || LOG "already online"
+        rm -f "$FAILS"
+        exit 0
+      fi
+      sleep 3; continue
+    fi
+
+    fails=$(cat "$FAILS" 2>/dev/null || echo 0)
+    (( fails >= MAX_FAILS )) && exit 0   # already gave up; wait for a manual login or reboot
+
+    magic=${portal##*\?}
+    base=${portal%/fgtauth*}
+    curl -s -m 8 --interface "$IFACE" "$portal" >/dev/null   # load the form, as a browser would
+    resp=$(curl -s -m 10 --interface "$IFACE" "$base/" \
+      --data-urlencode "4Tredir=$PROBE" \
+      --data-urlencode "magic=$magic" \
+      --data-urlencode "username=$IIITK_USER" \
+      --data-urlencode "password=$IIITK_PASS")
+
+    if grep -q 'keepalive' <<<"$resp"; then
+      LOG "logged in on $CONNECTION_ID"
+      rm -f "$FAILS"
+      exit 0
+    fi
+
+    fails=$((fails + 1))
+    echo "$fails" >"$FAILS"
+    LOG "login attempt $fails/$MAX_FAILS failed"
+    if (( fails >= MAX_FAILS )); then
+      LOG "stopped after $MAX_FAILS failed logins (user limit reached or wrong password?)"
+      notify "Auto-login failed $MAX_FAILS times and has stopped. Log in from the browser; auto-login resumes after that."
+      exit 0
+    fi
+    sleep 10
+  done
+)
+
+# Dispatcher: run in the background so connecting isn't held up.
+# Timer: stay in the foreground, or systemd would kill the login when the job ends.
+if [[ "$ACTION" == timer ]]; then
+  login
+else
+  login </dev/null >/dev/null 2>&1 &
+fi
+exit 0

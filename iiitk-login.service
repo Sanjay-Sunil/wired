@@ -1,0 +1,6 @@
+[Unit]
+Description=Re-login to the IIIT Kottayam Wi-Fi portal if the session expired
+
+[Service]
+Type=oneshot
+ExecStart=/etc/NetworkManager/dispatcher.d/90-iiitk-login timer
